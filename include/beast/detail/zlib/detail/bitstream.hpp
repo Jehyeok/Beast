@@ -50,6 +50,13 @@ class bitstream
     std::uint8_t n_ = 0;
 
 public:
+    // returns the number of bits in the reservoir
+    std::size_t
+    size() const
+    {
+        return n_;
+    }
+
     // discard n bits
     void
     drop(std::uint8_t n)
@@ -79,15 +86,37 @@ public:
     bool
     fill(std::uint8_t n, FwdIt& first, FwdIt const& last);
 
+    // fill 8 bits, unchecked
+    template<class FwdIt>
+    void
+    fill_8(FwdIt& it);
+
+    // fill 16 bits, unchecked
+    template<class FwdIt>
+    void
+    fill_16(FwdIt& it);
+
     // return n bits
     template<class Unsigned, class FwdIt>
     bool
     peek(Unsigned& value, std::uint8_t n, FwdIt& first, FwdIt const& last);
 
+    // return everything in the reservoir
+    value_type
+    peek_fast() const
+    {
+        return v_;
+    }
+
     // return n bits, and consume
     template<class Unsigned, class FwdIt>
     bool
     read(Unsigned& value, std::uint8_t n, FwdIt& first, FwdIt const& last);
+
+    // rewind by the number of whole bytes stored (unchecked)
+    template<class BidirIt>
+    void
+    rewind(BidirIt& it);
 };
 
 template<class FwdIt>
@@ -104,6 +133,28 @@ fill(std::uint8_t n, FwdIt& first, FwdIt const& last)
     }
     return true;
 }
+
+template<class FwdIt>
+inline
+void
+bitstream::
+fill_8(FwdIt& it)
+{
+    v_ += static_cast<value_type>(*it++) << n_;
+    n_ += 8;
+}    
+
+template<class FwdIt>
+inline
+void
+bitstream::
+fill_16(FwdIt& it)
+{
+    v_ += static_cast<value_type>(*it++) << n_;
+    n_ += 8;
+    v_ += static_cast<value_type>(*it++) << n_;
+    n_ += 8;
+}    
 
 template<class Unsigned, class FwdIt>
 bool
@@ -128,6 +179,17 @@ read(Unsigned& value, std::uint8_t n, FwdIt& first, FwdIt const& last)
     v_ >>= n;
     n_ -= n;
     return true;
+}
+
+template<class BidirIt>
+void
+bitstream::
+rewind(BidirIt& it)
+{
+    auto len = n_ >> 3;
+    it = std::prev(it, len);
+    n_ &= 7;
+    v_ &= (1U << n_) - 1;   
 }
 
 } // detail

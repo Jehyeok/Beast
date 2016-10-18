@@ -492,10 +492,20 @@ write(z_stream& zs, int flush)
 
         case LEN:
         {
-#if 0
+#if 1
             if(avail_in >= 6 && avail_out >= 258)
             {
-                inflate_fast(zs, out);
+                auto const nwritten = put - zs.next_out;
+                z_stream zc = zs;
+                zc.next_out = put;
+                zc.avail_out = outend - put;
+                zc.next_in = next;
+                zc.avail_in = end - next;
+                inflate_fast(zc, out);
+                put = zc.next_out;
+                next = zc.next_in;
+                in = zc.avail_in;
+                out = zc.avail_out;
                 if(mode_ == TYPE)
                     back_ = -1;
                 break;
@@ -752,12 +762,11 @@ inflate_fast(
     z_stream& zs,
     unsigned start)             // inflate()'s starting value for strm->avail_out
 {
-    const unsigned char *in;    // local strm->next_in
-    const unsigned char *last;  // have enough input while in < last
+    unsigned char const* in;    // local strm->next_in
+    unsigned char const* last;  // have enough input while in < last
     unsigned char *out;         // local strm->next_out
     unsigned char *beg;         // inflate()'s initial strm->next_out
     unsigned char *end;         // while out < end, enough space available
-    detail::code here;          // retrieved table entry
     unsigned op;                // code bits, operation, extra bits, or window position, window bytes to copy
     unsigned len;               // match length, unused bytes
     unsigned dist;              // match distance
@@ -777,69 +786,47 @@ inflate_fast(
        input data or output space */
     do
     {
-        if(bits_ < 15)
-        {
-            hold_ += (unsigned long)(*in++) << bits_;
-            bits_ += 8;
-            hold_ += (unsigned long)(*in++) << bits_;
-            bits_ += 8;
-        }
-        here = lencode_[hold_ & lmask];
-      dolen:
-        op = (unsigned)(here.bits);
-        hold_ >>= op;
-        bits_ -= op;
-        op = (unsigned)(here.op);
+        if(bi_.size() < 15)
+            bi_.fill_16(in);
+        auto cp = &lencode_[bi_.peek_fast() & lmask];
+    dolen:
+        bi_.drop(cp->bits);
+        op = (unsigned)(cp->op);
         if(op == 0)
         {
             // literal
-            *out++ = (unsigned char)(here.val);
+            *out++ = (unsigned char)(cp->val);
         }
         else if(op & 16)
         {
             // length base
-            len = (unsigned)(here.val);
+            len = (unsigned)(cp->val);
             op &= 15; // number of extra bits
             if(op)
             {
-                if(bits_ < op)
-                {
-                    hold_ += (unsigned long)(*in++) << bits_;
-                    bits_ += 8;
-                }
-                len += (unsigned)hold_ & ((1U << op) - 1);
-                hold_ >>= op;
-                bits_ -= op;
+                if(bi_.size() < op)
+                    bi_.fill_8(in);
+                len += (unsigned)bi_.peek_fast() & ((1U << op) - 1);
+                bi_.drop(op);
             }
-            if(bits_ < 15)
-            {
-                hold_ += (unsigned long)(*in++) << bits_;
-                bits_ += 8;
-                hold_ += (unsigned long)(*in++) << bits_;
-                bits_ += 8;
-            }
-            here = distcode_[hold_ & dmask];
-          dodist:
-            op = (unsigned)(here.bits);
-            hold_ >>= op;
-            bits_ -= op;
-            op = (unsigned)(here.op);
+            if(bi_.size() < 15)
+                bi_.fill_16(in);
+            cp = &distcode_[bi_.peek_fast() & dmask];
+        dodist:
+            bi_.drop(cp->bits);
+            op = (unsigned)(cp->op);
             if(op & 16)
             {
                 // distance base
-                dist = (unsigned)(here.val);
+                dist = (unsigned)(cp->val);
                 op &= 15; // number of extra bits
-                if(bits_ < op)
+                if(bi_.size() < op)
                 {
-                    hold_ += (unsigned long)(*in++) << bits_;
-                    bits_ += 8;
-                    if(bits_ < op)
-                    {
-                        hold_ += (unsigned long)(*in++) << bits_;
-                        bits_ += 8;
-                    }
+                    bi_.fill_8(in);
+                    if(bi_.size() < op)
+                        bi_.fill_8(in);
                 }
-                dist += (unsigned)hold_ & ((1U << op) - 1);
+                dist += (unsigned)bi_.peek_fast() & ((1U << op) - 1);
 #ifdef INFLATE_STRICT
                 if(dist > dmax_)
                 {
@@ -848,14 +835,14 @@ inflate_fast(
                     break;
                 }
 #endif
-                hold_ >>= op;
-                bits_ -= op;
+                bi_.drop(op);
+
                 op = (unsigned)(out - beg); // max distance in output
                 if(dist > op)
                 {
-                    // see if copy from window
+                    // copy from window
                     op = dist - op; // distance back in window
-                    if(op > whave_)
+                    if(op > w_.size())
                     {
                         if(sane_)
                         {
@@ -865,106 +852,22 @@ inflate_fast(
                             break;
                         }
                     }
-                    auto from = window_;
-                    if(wnext_ == 0)
-                    {
-                        // very common case
-                        from += wsize_ - op;
-                        if(op < len)
-                        {
-                            // some from window
-                            len -= op;
-                            do
-                            {
-                                *out++ = *from++;
-                            }
-                            while(--op);
-                            from = out - dist;  // rest from output */
-                        }
-                    }
-                    else if(wnext_ < op)
-                    {
-                        // wrap around window
-                        from += wsize_ + wnext_ - op;
-                        op -= wnext_;
-                        if(op < len)
-                        {
-                            // some from end of window
-                            len -= op;
-                            do
-                            {
-                                *out++ = *from++;
-                            } while(--op);
-                            from = window_;
-                            if(wnext_ < len)
-                            {
-                                // some from start of window
-                                op = wnext_;
-                                len -= op;
-                                do
-                                {
-                                    *out++ = *from++;
-                                }
-                                while(--op);
-                                from = out - dist; // rest from output
-                            }
-                        }
-                    }
-                    else
-                    {
-                        // contiguous in window
-                        from += wnext_ - op;
-                        if(op < len)
-                        {
-                            // some from window
-                            len -= op;
-                            do
-                            {
-                                *out++ = *from++;
-                            }
-                            while(--op);
-                            from = out - dist; // rest from output
-                        }
-                    }
-                    while(len > 2)
-                    {
-                        *out++ = *from++;
-                        *out++ = *from++;
-                        *out++ = *from++;
-                        len -= 3;
-                    }
-                    if(len)
-                    {
-                        *out++ = *from++;
-                        if(len > 1)
-                            *out++ = *from++;
-                    }
+                    auto const n = clamp(len, op);
+                    w_.read(out, op, n);
+                    out += n;
+                    len -= n;
                 }
-                else
+                if(len > 0)
                 {
-                    // copy direct from output
-                    auto from = out - dist;          
-                    do
-                    {
-                        // minimum length is three
-                        *out++ = *from++;
-                        *out++ = *from++;
-                        *out++ = *from++;
-                        len -= 3;
-                    }
-                    while(len > 2);
-                    if(len)
-                    {
-                        *out++ = *from++;
-                        if(len > 1)
-                            *out++ = *from++;
-                    }
+                    // copy from output
+                    std::memcpy(out, out - dist, len);
+                    out += len;
                 }
             }
             else if((op & 64) == 0)
             {
                 // 2nd level distance code
-                here = distcode_[here.val + (hold_ & ((1U << op) - 1))];
+                cp = &distcode_[cp->val + (bi_.peek_fast() & ((1U << op) - 1))];
                 goto dodist;
             }
             else
@@ -977,7 +880,7 @@ inflate_fast(
         else if((op & 64) == 0)
         {
             // 2nd level length code
-            here = lencode_[here.val + (hold_ & ((1U << op) - 1))];
+            cp = &lencode_[cp->val + (bi_.peek_fast() & ((1U << op) - 1))];
             goto dolen;
         }
         else if(op & 32)
@@ -996,17 +899,15 @@ inflate_fast(
     while(in < last && out < end);
 
     // return unused bytes (on entry, bits < 8, so in won't go too far back)
-    len = bits_ >> 3;
-    in -= len;
-    bits_ -= len << 3;
-    hold_ &= (1U << bits_) - 1;
+    bi_.rewind(in);
 
     // update state and return
     zs.next_in = in;
     zs.next_out = out;
-    zs.avail_in = (unsigned)(in < last ? 5 + (last - in) : 5 - (in - last));
+    zs.avail_in = (unsigned)(in < last ?
+        5 + (last - in) : 5 - (in - last));
     zs.avail_out = (unsigned)(out < end ?
-                                 257 + (end - out) : 257 - (out - end));
+        257 + (end - out) : 257 - (out - end));
 }
 
 /*
